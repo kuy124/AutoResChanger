@@ -7,23 +7,30 @@
 
 When launching older games, classic emulators, or modern competitive shooters, you often want your monitor to temporarily switch to a specific resolution or refresh rate. AutoRes Changer handles this process automatically in the background. It instantly detects when your configured program starts, changes the display settings, and safely restores your desktop to its original state the moment you close the program.
 
-To ensure the absolute lowest possible resource footprint on your system, AutoRes Changer is built entirely with native C++ and Win32 APIs. It does not run on bloated background frameworks, consuming less than 1 MB of RAM while resting silently in your system tray.
+To ensure the lowest possible resource footprint on your system, AutoRes Changer is built entirely with native C++ and Win32 APIs. It does not run on bloated background frameworks, consuming less than 1 MB of RAM while resting silently in your system tray.
 
 <hr>
 
 ## Quick Setup Guide
 
-Follow these steps to compile and set up AutoRes Changer on your computer.
+Follow these steps to set up or compile AutoRes Changer on your computer.
 
-### Step 1: Prepare the Files
+### Option A: Download Pre-compiled Packages
+You do not need to compile the code manually. You can download the standalone executable immediately:
+1. Go to the **Release** section on this repository page.
+2. Download the latest `AutoResChanger.exe` file.
+3. Place it anywhere on your computer and run it. No installation is required.
+
+### Option B: Compile from Source
+If you prefer to compile the application yourself using a lightweight compiler like MSYS2/MinGW-w64:
+
+#### Step 1: Prepare the Files
 1. Create a folder on your computer named `AutoResChanger`.
 2. Save your C++ source code as `main.cpp` inside this folder.
-3. Save your resource script as `resource.rc` inside the same folder.
+3. Save your resource script as `resource.rc` inside this folder.
 4. Place any custom icon file you want to use inside the folder and name it `app.ico`.
 
-### Step 2: Compile the Program
-Because the application uses native Windows components, you can compile it instantly using a lightweight compiler like MSYS2/MinGW-w64.
-
+#### Step 2: Compile the Program
 1. Open your terminal in the folder where your files are located.
 2. Run the resource compiler to prepare your custom icon:
    ```bash
@@ -33,8 +40,6 @@ Because the application uses native Windows components, you can compile it insta
    ```bash
    g++ -O2 main.cpp resource.res -o AutoResChanger.exe -mwindows -municode -luser32 -lgdi32 -lshell32 -lcomdlg32 -ladvapi32
    ```
-
-*The compiler will immediately produce a tiny, standalone `AutoResChanger.exe` file containing your custom icon, ready for use with no installations required.*
 
 <hr>
 
