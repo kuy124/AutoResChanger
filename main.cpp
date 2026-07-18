@@ -113,7 +113,9 @@ void SetRunAtStartup(bool enable) {
         if (enable) {
             WCHAR path[MAX_PATH];
             GetModuleFileNameW(NULL, path, MAX_PATH);
-            RegSetValueExW(hKey, L"AutoResChanger", 0, REG_SZ, (BYTE*)path, (wcslen(path) + 1) * sizeof(WCHAR));
+            // Properly quote path and add the silent flag so it starts minimized in the background
+            std::wstring cmd = L"\"" + std::wstring(path) + L"\" -silent";
+            RegSetValueExW(hKey, L"AutoResChanger", 0, REG_SZ, (const BYTE*)cmd.c_str(), (DWORD)((cmd.length() + 1) * sizeof(WCHAR)));
         } else {
             RegDeleteValueW(hKey, L"AutoResChanger");
         }
@@ -546,8 +548,25 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     PopulateMonitors(); RefreshList();
     std::thread monitorThread(MonitorLoop);
 
-    if (wcsstr(lpCmdLine, L"-silent") || nCmdShow == SW_HIDE) ShowWindow(g_hMain, SW_HIDE);
-    else { ShowWindow(g_hMain, nCmdShow); UpdateWindow(g_hMain); }
+    // Parse command line case-insensitively
+    bool startSilent = false;
+    std::wstring cmdLine(lpCmdLine);
+    for (size_t i = 0; i < cmdLine.length(); ++i) {
+        if (cmdLine[i] >= L'A' && cmdLine[i] <= L'Z') {
+            cmdLine[i] = cmdLine[i] - L'A' + L'a';
+        }
+    }
+    if (cmdLine.find(L"silent") != std::wstring::npos || cmdLine.find(L"min") != std::wstring::npos) {
+        startSilent = true;
+    }
+
+    // Hide on boot if requested silently, or if the system launched it in a minimized/hidden state
+    if (startSilent || nCmdShow == SW_HIDE || nCmdShow == SW_MINIMIZE || nCmdShow == SW_SHOWMINIMIZED || nCmdShow == SW_SHOWMINNOACTIVE) {
+        ShowWindow(g_hMain, SW_HIDE);
+    } else {
+        ShowWindow(g_hMain, nCmdShow);
+        UpdateWindow(g_hMain);
+    }
 
     MSG msg; while (GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
     g_MonitorRunning = false; monitorThread.join();
