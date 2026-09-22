@@ -33,7 +33,9 @@ If you prefer to compile the application yourself using a lightweight compiler l
 #### Step 2: Compile the Program
 Pick whichever build method you prefer.
 
-**Quick build (Windows PowerShell script).** The bundled `build.ps1` auto-detects the MinGW toolchain and runs everything for you:
+**Easiest: double-click `build.bat`.** It auto-detects the MinGW toolchain, compiles the resource and the program, and leaves `AutoResChanger.exe` next to the script — no terminal needed. If the compiler isn't found it prints exactly what to install.
+
+**PowerShell script.** `build.ps1` does the same with a few extra options:
 ```powershell
 .\build.ps1              # release build
 .\build.ps1 -Debug       # debug build with symbols
