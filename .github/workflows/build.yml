@@ -37,6 +37,19 @@ jobs:
               -luser32 -lgdi32 -lshell32 -lcomdlg32 -ladvapi32 \
               -ldwmapi -luxtheme -lole32 -lcomctl32
 
+      - name: Build and run unit tests
+        run: |
+          g++ -O2 -std=c++17 -Wall -Wextra \
+              -Wno-unknown-pragmas -Wno-missing-field-initializers \
+              tests/test_main.cpp -o tests/test_runner.exe \
+              -luser32 -lgdi32 -lshell32 -lcomdlg32 -ladvapi32 \
+              -ldwmapi -luxtheme -lole32 -lcomctl32
+          ./tests/test_runner.exe
+
+      - name: Run GUI end-to-end tests
+        shell: pwsh
+        run: ./tests/gui_save_test.ps1
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:

@@ -44,6 +44,7 @@ Pick whichever build method you prefer.
 ```bash
 cmake -S . -B build -G "MinGW Makefiles"
 cmake --build build
+ctest --test-dir build --output-on-failure   # run unit tests
 ```
 
 **Manual (MinGW-w64).** Run the resource compiler, then the C++ compiler. Note that `-municode` and linking `resource.res` are required so the Unicode resource APIs resolve correctly:
@@ -52,7 +53,22 @@ windres resource.rc -O coff -o resource.res
 g++ -O2 -Wall -Wextra main.cpp resource.res -o AutoResChanger.exe -mwindows -municode -luser32 -lgdi32 -lshell32 -lcomdlg32 -ladvapi32 -ldwmapi -luxtheme -lole32 -lcomctl32
 ```
 
-A GitHub Actions workflow (`.github/workflows/build.yml`) automatically builds the executable on every push and attaches it to a release whenever you push a `v*` tag.
+A GitHub Actions workflow (`.github/workflows/build.yml`) automatically builds the executable and runs both the unit and GUI tests on every push, then attaches the binary to a release whenever you push a `v*` tag.
+
+---
+
+## Testing
+
+AutoRes Changer ships with two layers of automated tests:
+
+* **Headless unit tests** (`tests/test_main.cpp`) cover the pure logic: path parsing, config save/load round-trips, atomic-write cleanliness, mode enumeration, and process detection. They compile with `-DTESTING`, which excludes the GUI. Run them via `ctest` (see above) or:
+  ```powershell
+  .\tests\run_tests.ps1
+  ```
+* **GUI end-to-end tests** (`tests/gui_save_test.ps1`) drive the real window through Win32 messages to prove the full Save/Delete/validation flow writes the correct `config.ini` with no leftover temp files:
+  ```powershell
+  .\tests\run_tests.ps1 -Gui
+  ```
 
 <hr>
 
@@ -72,9 +88,11 @@ Managing your custom application profiles is straightforward and handled entirel
 ### Testing Modes Safely
 If you want to verify whether a custom resolution or refresh rate is supported by your monitor before saving it:
 1. Input your target dimensions or select an existing profile.
-2. Click the **Test Display Settings** button.
-3. Your screen will temporarily transition to the selected mode.
-4. A prompt will appear on your screen. Clicking **OK** keeps the mode; if you do nothing, the mode automatically reverts to your original desktop settings after 15 seconds. This guarantees you can always recover even if the tested mode renders your display unreadable.
+2. Click the **Test Display Settings** button. The button becomes **Keep This Mode** and a countdown starts.
+3. Your screen temporarily transitions to the selected mode.
+4. Click **Keep This Mode** to confirm, or simply do nothing — after 15 seconds the utility automatically reverts to your original desktop settings. This guarantees you can always recover even if the tested mode renders your display unreadable.
+
+> Validation feedback (missing path, invalid resolution, unsupported mode) is shown in a non-blocking status line beneath the buttons rather than a pop-up dialog, so the interface never traps you.
 
 ---
 

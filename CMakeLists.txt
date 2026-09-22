@@ -36,3 +36,17 @@ endif()
 # Emit the binary next to the source tree for convenience.
 set_target_properties(AutoResChanger PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+# ---- Tests --------------------------------------------------------------
+# Headless unit tests (compiled with -DTESTING, which excludes the GUI).
+enable_testing()
+add_executable(autores_tests tests/test_main.cpp)
+target_compile_definitions(autores_tests PRIVATE UNICODE _UNICODE)
+if(MSVC)
+    target_compile_options(autores_tests PRIVATE /W4 /permissive-)
+    target_link_libraries(autores_tests PRIVATE user32 gdi32 shell32 comdlg32 advapi32 dwmapi ole32 comctl32)
+else()
+    target_compile_options(autores_tests PRIVATE -Wall -Wextra -Wno-unknown-pragmas -Wno-missing-field-initializers)
+    target_link_libraries(autores_tests PRIVATE user32 gdi32 shell32 comdlg32 advapi32 dwmapi uxtheme ole32 comctl32)
+endif()
+add_test(NAME unit COMMAND autores_tests)

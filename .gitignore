@@ -8,5 +8,9 @@
 build/
 out/
 
+# Test artifacts
+tests/test_runner.exe
+tests/*.dSYM/
+
 # MSVC / MinGW
 *.dSYM/

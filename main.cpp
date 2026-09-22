@@ -95,17 +95,22 @@ bool g_DarkMode = false;       // UI theme preference
 bool g_LoggingEnabled = false; // Persisted logging preference
 
 // UI Handles
+#ifndef TESTING
 HWND g_hMain, g_hList, g_hExe, g_hDisplayCombo, g_hW, g_hH, g_hHz, g_hDelay;
 HWND g_hRestore, g_hEnable, g_hStartup, g_hPresetCombo, g_hSupportedCombo;
 HWND g_hListLabel, g_hExeLabel, g_hBtnBrowse, g_hDisplayLabel, g_hPresetLabel;
 HWND g_hWLabel, g_hHLabel, g_hHzLabel, g_hDelayLabel, g_hSaveBtn, g_hDelBtn, g_hLaunchBtn, g_hTestBtn;
-HWND g_hSupportedLabel, g_hLogChk, g_hDarkChk;
+HWND g_hSupportedLabel, g_hLogChk, g_hDarkChk, g_hStatusLabel;
+#endif
 
 #define WM_TRAYICON (WM_APP + 1)
+#ifndef TESTING
 NOTIFYICONDATAW g_Nid = {};
+#endif
 std::vector<std::wstring> g_MonitorDevices;
 std::wstring g_LogPath;
 std::vector<ModeEntry> g_SupportedModesCache;
+COLORREF g_StatusColor = RGB(40, 40, 40); // current inline-status text colour
 
 // ==========================================
 // LOGGING
@@ -294,6 +299,7 @@ void SaveConfig() {
 // ==========================================
 // DISPLAY MANAGEMENT
 // ==========================================
+#ifndef TESTING
 void PopulateMonitors() {
     g_MonitorDevices.clear();
     DISPLAY_DEVICEW dd = { sizeof(dd) };
@@ -311,6 +317,7 @@ void PopulateMonitors() {
         devNum++;
     }
 }
+#endif
 
 DEVMODEW GetCurrentRes(const std::wstring& devName) {
     DEVMODEW dm = { 0 }; dm.dmSize = sizeof(dm);
@@ -342,6 +349,7 @@ std::vector<ModeEntry> EnumModesForDevice(const std::wstring& devName) {
 }
 
 // Rebuilds the Supported Modes dropdown for the currently selected display.
+#ifndef TESTING
 void RefreshSupportedModes() {
     if (!g_hSupportedCombo) return;
     SendMessage(g_hSupportedCombo, CB_RESETCONTENT, 0, 0);
@@ -359,6 +367,7 @@ void RefreshSupportedModes() {
     g_SupportedModesCache = modes;   // index 0 == placeholder, so cache index = combo index-1
     SendMessage(g_hSupportedCombo, CB_SETCURSEL, 0, 0);
 }
+#endif
 
 // Extracts the icon for a given executable and returns a small HICON (caller
 // owns it) or NULL on failure.
@@ -492,6 +501,7 @@ void MonitorLoop() {
 // ==========================================
 // UI MANAGEMENT
 // ==========================================
+#ifndef TESTING
 // Icons are owned per rendered list row and re-created on refresh.
 std::vector<HICON> g_ListItemIcons;
 
@@ -582,6 +592,7 @@ void ApplyTheme(HWND hwnd) {
 // previous mode. This is the safety net that the README always promised but
 // the original blocking MessageBox never delivered.
 #define TIMER_TEST_REVERT 1
+#define TIMER_CLEAR_STATUS 2
 #define TEST_REVERT_SECONDS 15
 
 DEVMODEW g_TestOriginal;
@@ -593,6 +604,32 @@ void CancelTestTimer(HWND hwnd) {
         KillTimer(hwnd, TIMER_TEST_REVERT);
         g_TestActive = false;
     }
+}
+
+// Colour codes for the inline status line.
+enum class StatusKind { Info, Warn, Error, Ok };
+
+// Sets the inline status text (replacing the old modal message boxes). The
+// message stays visible for a few seconds, then auto-clears. This keeps the UI
+// responsive and fully automatable.
+void SetStatus(HWND hwnd, const std::wstring& text, StatusKind kind) {
+    if (!g_hStatusLabel) return;
+    SetWindowTextW(g_hStatusLabel, text.c_str());
+    COLORREF color = RGB(0, 120, 0);
+    switch (kind) {
+        case StatusKind::Warn:  color = RGB(180, 100, 0); break;
+        case StatusKind::Error: color = RGB(190, 30, 30); break;
+        case StatusKind::Ok:    color = RGB(0, 130, 0);   break;
+        case StatusKind::Info:  default: color = g_DarkMode ? RGB(210, 210, 210) : RGB(40, 40, 40); break;
+    }
+    // A static's text colour follows the WM_CTLCOLORSTATIC of its parent, so we
+    // store the desired colour and let the parent render it.
+    g_StatusColor = color;
+    InvalidateRect(g_hStatusLabel, NULL, TRUE);
+
+    // Restart the auto-clear timer.
+    KillTimer(hwnd, TIMER_CLEAR_STATUS);
+    SetTimer(hwnd, TIMER_CLEAR_STATUS, 6000, NULL);
 }
 
 // Returns true and writes the value when the field holds a positive integer.
@@ -615,7 +652,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             // Right Panel
             g_hExeLabel = CreateWindowW(L"STATIC", L"Executable Path:", WS_VISIBLE | WS_CHILD, 0, 0, 0, 0, hwnd, NULL, NULL, NULL);
-            g_hExe = CreateWindowW(L"EDIT", L"", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd, NULL, NULL, NULL);
+            g_hExe = CreateWindowW(L"EDIT", L"", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd, (HMENU)115, NULL, NULL);
             g_hBtnBrowse = CreateWindowW(L"BUTTON", L"...", WS_VISIBLE | WS_CHILD, 0, 0, 0, 0, hwnd, (HMENU)101, NULL, NULL);
 
             g_hDisplayLabel = CreateWindowW(L"STATIC", L"Target Display (Monitor):", WS_VISIBLE | WS_CHILD, 0, 0, 0, 0, hwnd, NULL, NULL, NULL);
@@ -634,13 +671,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g_hH = CreateWindowW(L"EDIT", L"1080", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER, 0, 0, 0, 0, hwnd, (HMENU)109, NULL, NULL);
 
             g_hHzLabel = CreateWindowW(L"STATIC", L"Hz (0=Def):", WS_VISIBLE | WS_CHILD, 0, 0, 0, 0, hwnd, NULL, NULL, NULL);
-            g_hHz = CreateWindowW(L"EDIT", L"0", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER, 0, 0, 0, 0, hwnd, NULL, NULL, NULL);
+            g_hHz = CreateWindowW(L"EDIT", L"0", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER, 0, 0, 0, 0, hwnd, (HMENU)116, NULL, NULL);
 
             g_hDelayLabel = CreateWindowW(L"STATIC", L"Delay (sec):", WS_VISIBLE | WS_CHILD, 0, 0, 0, 0, hwnd, NULL, NULL, NULL);
-            g_hDelay = CreateWindowW(L"EDIT", L"0", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER, 0, 0, 0, 0, hwnd, NULL, NULL, NULL);
+            g_hDelay = CreateWindowW(L"EDIT", L"0", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER, 0, 0, 0, 0, hwnd, (HMENU)117, NULL, NULL);
 
-            g_hRestore = CreateWindowW(L"BUTTON", L"Restore resolution on exit", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 0, 0, 0, 0, hwnd, NULL, NULL, NULL);
-            g_hEnable = CreateWindowW(L"BUTTON", L"Enable this profile", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 0, 0, 0, 0, hwnd, NULL, NULL, NULL);
+            g_hRestore = CreateWindowW(L"BUTTON", L"Restore resolution on exit", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 0, 0, 0, 0, hwnd, (HMENU)118, NULL, NULL);
+            g_hEnable = CreateWindowW(L"BUTTON", L"Enable this profile", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 0, 0, 0, 0, hwnd, (HMENU)119, NULL, NULL);
             SendMessage(g_hRestore, BM_SETCHECK, BST_CHECKED, 0);
             SendMessage(g_hEnable, BM_SETCHECK, BST_CHECKED, 0);
 
@@ -648,6 +685,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g_hDelBtn = CreateWindowW(L"BUTTON", L"Delete", WS_VISIBLE | WS_CHILD, 0, 0, 0, 0, hwnd, (HMENU)103, NULL, NULL);
             g_hLaunchBtn = CreateWindowW(L"BUTTON", L"Launch App", WS_VISIBLE | WS_CHILD, 0, 0, 0, 0, hwnd, (HMENU)105, NULL, NULL);
             g_hTestBtn = CreateWindowW(L"BUTTON", L"Test Display Settings", WS_VISIBLE | WS_CHILD, 0, 0, 0, 0, hwnd, (HMENU)104, NULL, NULL);
+
+            // Inline, non-modal status line. Replaces blocking message boxes so
+            // the UI stays responsive and remains scriptable/automatable.
+            g_hStatusLabel = CreateWindowW(L"STATIC", L"", WS_VISIBLE | WS_CHILD | SS_LEFTNOWORDWRAP, 0, 0, 0, 0, hwnd, (HMENU)114, NULL, NULL);
 
             g_hStartup = CreateWindowW(L"BUTTON", L"Start automatically with Windows (Minimized)", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 0, 0, 0, 0, hwnd, (HMENU)106, NULL, NULL);
             if (GetRunAtStartup()) SendMessage(g_hStartup, BM_SETCHECK, BST_CHECKED, 0);
@@ -737,6 +778,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             MoveWindow(g_hLaunchBtn, rightX + btnW * 2, 292, btnW - 5, 30, TRUE);
 
             MoveWindow(g_hTestBtn, rightX, 326, rightW, 30, TRUE);
+            MoveWindow(g_hStatusLabel, rightX, 360, rightW, 18, TRUE);
 
             // Bottom row of options.
             int optW = rightW / 2;
@@ -753,8 +795,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         case WM_CTLCOLORSTATIC:
         case WM_CTLCOLORBTN: {
+            HDC hdc = (HDC)wParam;
+            HWND ctl = (HWND)lParam;
+            // The inline status label uses its own colour regardless of theme.
+            if (ctl == g_hStatusLabel) {
+                SetTextColor(hdc, g_StatusColor);
+                SetBkColor(hdc, g_DarkMode ? RGB(32, 32, 32) : GetSysColor(COLOR_WINDOW));
+                return (LRESULT)(g_DarkMode && g_hDarkBrush ? g_hDarkBrush : GetSysColorBrush(COLOR_WINDOW));
+            }
             if (g_DarkMode && g_hDarkBrush) {
-                HDC hdc = (HDC)wParam;
                 SetTextColor(hdc, RGB(230, 230, 230));
                 SetBkColor(hdc, RGB(32, 32, 32));
                 return (LRESULT)g_hDarkBrush;
@@ -812,12 +861,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 WCHAR exe[MAX_PATH];
                 GetWindowTextW(g_hExe, exe, MAX_PATH);
                 if (wcslen(exe) == 0) {
-                    MessageBoxW(hwnd, L"Select an executable path first.", L"Missing Path", MB_OK | MB_ICONWARNING);
+                    SetStatus(hwnd, L"⚠ Select an executable path first.", StatusKind::Warn);
                     break;
                 }
                 int w = 0, h = 0;
                 if (!ReadPositiveInt(g_hW, 1, 32767, w) || !ReadPositiveInt(g_hH, 1, 32767, h)) {
-                    MessageBoxW(hwnd, L"Width and Height must be positive numbers (1-32767).", L"Invalid Resolution", MB_OK | MB_ICONWARNING);
+                    SetStatus(hwnd, L"⚠ Width and Height must be 1-32767.", StatusKind::Warn);
                     break;
                 }
                 WCHAR hzbuf[16] = { 0 }, delbuf[16] = { 0 };
@@ -850,13 +899,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 SaveConfig();
                 PublishSnapshot();
                 RefreshList(targetIdx);
+                SetStatus(hwnd, L"✔ Saved profile: " + p.exeName, StatusKind::Ok);
             } else if (wmId == 103) { // Delete
                 int idx = SendMessage(g_hList, LB_GETCURSEL, 0, 0);
-                if (idx != LB_ERR) { g_Profiles.erase(g_Profiles.begin() + idx); SaveConfig(); PublishSnapshot(); RefreshList(); SetWindowTextW(g_hExe, L""); }
-            } else if (wmId == 104) { // Test
+                if (idx != LB_ERR) {
+                    g_Profiles.erase(g_Profiles.begin() + idx); SaveConfig(); PublishSnapshot();
+                    RefreshList(); SetWindowTextW(g_hExe, L"");
+                    SetStatus(hwnd, L"✔ Profile deleted.", StatusKind::Ok);
+                } else {
+                    SetStatus(hwnd, L"⚠ Select a profile to delete.", StatusKind::Warn);
+                }
+            } else if (wmId == 104) { // Test / Confirm
+                // Two-phase, non-blocking test. If a test is already running,
+                // this click means "keep it". Otherwise we apply the mode and
+                // arm the auto-revert countdown.
+                if (g_TestActive) {
+                    CancelTestTimer(hwnd);
+                    SetWindowTextW(g_hTestBtn, L"Test Display Settings");
+                    SetStatus(hwnd, L"✔ Kept the tested display mode.", StatusKind::Ok);
+                    break;
+                }
+
                 int w = 0, h = 0, hz = 0;
                 if (!ReadPositiveInt(g_hW, 1, 32767, w) || !ReadPositiveInt(g_hH, 1, 32767, h)) {
-                    MessageBoxW(hwnd, L"Enter a valid Width and Height before testing.", L"Invalid Input", MB_OK | MB_ICONWARNING);
+                    SetStatus(hwnd, L"⚠ Enter a valid Width and Height before testing.", StatusKind::Warn);
                     break;
                 }
                 // Hz is optional: blank or 0 means "use the driver default".
@@ -874,14 +940,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     g_TestOriginal = orig;
                     g_TestDevice = dev;
                     g_TestActive = true;
+                    SetWindowTextW(g_hTestBtn, L"Keep This Mode");
                     SetTimer(hwnd, TIMER_TEST_REVERT, (UINT)TEST_REVERT_SECONDS * 1000, NULL);
-                    std::wstring msg = L"Resolution applied. Click OK to keep it, or it will "
-                                       L"automatically revert in " + std::to_wstring(TEST_REVERT_SECONDS) + L" seconds.";
-                    MessageBoxW(hwnd, msg.c_str(), L"Testing Display Settings", MB_OK | MB_ICONINFORMATION);
-                    // If the user pressed OK within the window, keep the mode.
-                    if (g_TestActive) CancelTestTimer(hwnd);
+                    std::wstring msg = L"✔ Mode applied — auto-reverts in " +
+                                       std::to_wstring(TEST_REVERT_SECONDS) +
+                                       L"s. Click \"Keep This Mode\" to keep it.";
+                    SetStatus(hwnd, msg, StatusKind::Info);
+                    MessageBeep(MB_ICONINFORMATION);
                 } else {
-                    MessageBoxW(hwnd, L"Monitor does not support this mode.", L"Error", MB_OK | MB_ICONERROR);
+                    SetStatus(hwnd, L"✖ Monitor does not support this mode.", StatusKind::Error);
+                    MessageBeep(MB_ICONERROR);
                 }
             } else if (wmId == 105) { // Launch App
                 WCHAR exe[MAX_PATH]; GetWindowTextW(g_hExe, exe, MAX_PATH);
@@ -925,6 +993,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 RestoreRes(g_TestDevice, g_TestOriginal);
                 g_TestActive = false;
                 KillTimer(hwnd, TIMER_TEST_REVERT);
+                SetWindowTextW(g_hTestBtn, L"Test Display Settings");
+                SetStatus(hwnd, L"↩ Reverted to previous display mode (test not confirmed).", StatusKind::Info);
+            } else if (wParam == TIMER_CLEAR_STATUS) {
+                KillTimer(hwnd, TIMER_CLEAR_STATUS);
+                SetWindowTextW(g_hStatusLabel, L"");
             }
             break;
         }
@@ -982,9 +1055,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 std::wstring lower = ToLowerCopy(path);
                 if (lower.size() >= 4 && lower.substr(lower.size() - 4) == L".exe") {
                     SetWindowTextW(g_hExe, path.c_str());
+                    SetStatus(hwnd, L"✔ Loaded executable: " + GetFileName(path), StatusKind::Ok);
                     LogMsg(L"Dropped executable: " + path);
                 } else {
-                    MessageBoxW(hwnd, L"Please drop an .exe file.", L"Unsupported File", MB_OK | MB_ICONINFORMATION);
+                    SetStatus(hwnd, L"⚠ Please drop an .exe file.", StatusKind::Warn);
                 }
             }
             DragFinish(hDrop);
@@ -1143,3 +1217,4 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     if (g_hInstanceMutex) { CloseHandle(g_hInstanceMutex); g_hInstanceMutex = NULL; }
     return (int)msg.wParam;
 }
+#endif // !TESTING
