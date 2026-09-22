@@ -13,6 +13,9 @@
 #include <vector>
 #include <thread>
 #include <atomic>
+#include <mutex>
+#include <memory>
+#include <algorithm>
 
 // ==========================================
 // DATA STRUCTURES & PRESETS
@@ -51,15 +54,29 @@ const std::vector<ResTemplate> g_Presets = {
     { L"640 x 480 (VGA 4:3)", 640, 480 }
 };
 
+// The profile list is owned exclusively by the UI thread. The monitor thread
+// never touches g_Profiles directly; instead the UI thread publishes an
+// immutable snapshot that the worker reads. This eliminates the data race and
+// the dangling-pointer bug that occurred when the vector reallocated.
 std::vector<AppProfile> g_Profiles;
-AppProfile* g_ActiveProfile = nullptr;
+std::mutex g_SnapshotMutex;
+std::shared_ptr<const std::vector<AppProfile>> g_ProfileSnapshot;
+
+// NOTE: g_OriginalDevMode / g_ResChanged / g_ProcessFoundTime / g_ActiveIndex
+// are touched only by the monitor thread, except for the explicit
+// restore-on-exit path which is serialized via g_RestoreMutex.
 DEVMODEW g_OriginalDevMode;
 bool g_ResChanged = false;
 std::atomic<bool> g_MonitorRunning(true);
 std::wstring g_IniPath;
-ULONGLONG g_ProcessFoundTime = 0;
+std::atomic<ULONGLONG> g_ProcessFoundTime(0);
+std::atomic<int> g_ActiveIndex(-1); // index into the *current snapshot*, or -1
+AppProfile g_ActiveProfileCopy;    // value copy of the active profile (never dangles)
+std::mutex g_RestoreMutex;         // serializes restore between UI + monitor threads
 bool g_IgnoreEditChange = false;
 HINSTANCE g_hInst = NULL; // Stores instance handle for loading the baked-in icon
+HANDLE g_hInstanceMutex = NULL; // Single-instance guard
+HICON g_hAppIcon = NULL; // Owned icon handle, freed on exit
 
 // UI Handles
 HWND g_hMain, g_hList, g_hExe, g_hDisplayCombo, g_hW, g_hH, g_hHz, g_hDelay;
@@ -80,10 +97,12 @@ std::wstring GetFileName(const std::wstring& path) {
 }
 
 bool IsProcessRunning(const std::wstring& processName) {
+    if (processName.empty()) return false;
     bool exists = false;
     PROCESSENTRY32W entry;
     entry.dwSize = sizeof(PROCESSENTRY32W);
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return false;
     if (Process32FirstW(snapshot, &entry)) {
         do {
             if (_wcsicmp(entry.szExeFile, processName.c_str()) == 0) {
@@ -93,6 +112,14 @@ bool IsProcessRunning(const std::wstring& processName) {
     }
     CloseHandle(snapshot);
     return exists;
+}
+
+// Republish an immutable snapshot of the profile list for the monitor thread.
+// Must be called from the UI thread whenever g_Profiles changes.
+void PublishSnapshot() {
+    auto snap = std::make_shared<std::vector<AppProfile>>(g_Profiles);
+    std::lock_guard<std::mutex> lock(g_SnapshotMutex);
+    g_ProfileSnapshot = std::move(snap);
 }
 
 bool GetRunAtStartup() {
@@ -161,23 +188,34 @@ void LoadConfig() {
 }
 
 void SaveConfig() {
-    WritePrivateProfileStringW(NULL, NULL, NULL, g_IniPath.c_str()); 
-    DeleteFileW(g_IniPath.c_str());
-    
-    WritePrivateProfileStringW(L"Settings", L"Count", std::to_wstring(g_Profiles.size()).c_str(), g_IniPath.c_str());
+    if (g_IniPath.empty()) return;
+
+    // Write to a temporary file first, then atomically replace the real one so
+    // a crash or power loss mid-save cannot corrupt config.ini.
+    std::wstring tmpPath = g_IniPath + L".tmp";
+    DeleteFileW(tmpPath.c_str());
+
+    WritePrivateProfileStringW(L"Settings", L"Count", std::to_wstring(g_Profiles.size()).c_str(), tmpPath.c_str());
     
     for (size_t i = 0; i < g_Profiles.size(); ++i) {
         std::wstring sec = L"Profile_" + std::to_wstring(i);
-        WritePrivateProfileStringW(sec.c_str(), L"Exe", g_Profiles[i].exePath.c_str(), g_IniPath.c_str());
-        WritePrivateProfileStringW(sec.c_str(), L"Device", g_Profiles[i].displayDev.c_str(), g_IniPath.c_str());
-        WritePrivateProfileStringW(sec.c_str(), L"W", std::to_wstring(g_Profiles[i].targetW).c_str(), g_IniPath.c_str());
-        WritePrivateProfileStringW(sec.c_str(), L"H", std::to_wstring(g_Profiles[i].targetH).c_str(), g_IniPath.c_str());
-        WritePrivateProfileStringW(sec.c_str(), L"Hz", std::to_wstring(g_Profiles[i].targetHz).c_str(), g_IniPath.c_str());
-        WritePrivateProfileStringW(sec.c_str(), L"Delay", std::to_wstring(g_Profiles[i].delaySec).c_str(), g_IniPath.c_str());
-        WritePrivateProfileStringW(sec.c_str(), L"Restore", g_Profiles[i].restore ? L"1" : L"0", g_IniPath.c_str());
-        WritePrivateProfileStringW(sec.c_str(), L"Enabled", g_Profiles[i].enabled ? L"1" : L"0", g_IniPath.c_str());
+        WritePrivateProfileStringW(sec.c_str(), L"Exe", g_Profiles[i].exePath.c_str(), tmpPath.c_str());
+        WritePrivateProfileStringW(sec.c_str(), L"Device", g_Profiles[i].displayDev.c_str(), tmpPath.c_str());
+        WritePrivateProfileStringW(sec.c_str(), L"W", std::to_wstring(g_Profiles[i].targetW).c_str(), tmpPath.c_str());
+        WritePrivateProfileStringW(sec.c_str(), L"H", std::to_wstring(g_Profiles[i].targetH).c_str(), tmpPath.c_str());
+        WritePrivateProfileStringW(sec.c_str(), L"Hz", std::to_wstring(g_Profiles[i].targetHz).c_str(), tmpPath.c_str());
+        WritePrivateProfileStringW(sec.c_str(), L"Delay", std::to_wstring(g_Profiles[i].delaySec).c_str(), tmpPath.c_str());
+        WritePrivateProfileStringW(sec.c_str(), L"Restore", g_Profiles[i].restore ? L"1" : L"0", tmpPath.c_str());
+        WritePrivateProfileStringW(sec.c_str(), L"Enabled", g_Profiles[i].enabled ? L"1" : L"0", tmpPath.c_str());
     }
-    WritePrivateProfileStringW(NULL, NULL, NULL, g_IniPath.c_str()); 
+    // Flush the file to disk before swapping it in.
+    WritePrivateProfileStringW(NULL, NULL, NULL, tmpPath.c_str());
+
+    if (!MoveFileExW(tmpPath.c_str(), g_IniPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        // Fallback: if the atomic replace failed, try a plain replace.
+        DeleteFileW(g_IniPath.c_str());
+        MoveFileW(tmpPath.c_str(), g_IniPath.c_str());
+    }
 }
 
 // ==========================================
@@ -219,30 +257,71 @@ void RestoreRes(const std::wstring& devName, DEVMODEW& dm) {
     ChangeDisplaySettingsExW(devName.empty() ? NULL : devName.c_str(), &dm, NULL, CDS_FULLSCREEN, NULL);
 }
 
+// Restore the resolution if a profile change is currently active. Safe to call
+// from either thread; the restore itself is serialized by g_RestoreMutex.
+// Returns true if a restore was performed.
+bool RestoreActiveIfChanged() {
+    std::lock_guard<std::mutex> lock(g_RestoreMutex);
+    if (g_ActiveIndex >= 0 && g_ResChanged) {
+        RestoreRes(g_ActiveProfileCopy.displayDev, g_OriginalDevMode);
+        g_ResChanged = false;
+        g_ActiveIndex = -1;
+        g_ProcessFoundTime = 0;
+        return true;
+    }
+    return false;
+}
+
+// Clears the active-state bookkeeping without touching the display. Used when
+// the profile was set to not restore, or the change never succeeded.
+void ClearActiveState() {
+    std::lock_guard<std::mutex> lock(g_RestoreMutex);
+    g_ResChanged = false;
+    g_ActiveIndex = -1;
+    g_ProcessFoundTime = 0;
+}
+
 // ==========================================
 // BACKGROUND THREAD
 // ==========================================
 void MonitorLoop() {
     while (g_MonitorRunning) {
-        if (g_ActiveProfile != nullptr) {
-            if (!IsProcessRunning(g_ActiveProfile->exeName)) {
-                if (g_ActiveProfile->restore && g_ResChanged) {
-                    RestoreRes(g_ActiveProfile->displayDev, g_OriginalDevMode);
-                }
-                g_ActiveProfile = nullptr; g_ResChanged = false; g_ProcessFoundTime = 0;
+        // Grab the latest immutable snapshot (cheap shared_ptr copy).
+        std::shared_ptr<const std::vector<AppProfile>> snap;
+        {
+            std::lock_guard<std::mutex> lock(g_SnapshotMutex);
+            snap = g_ProfileSnapshot;
+        }
+
+        if (g_ActiveIndex >= 0) {
+            // An active profile is being watched. If it was removed from the
+            // config, or its process exited, restore and stop watching.
+            bool stillConfigured = (snap && g_ActiveIndex < (int)snap->size());
+            bool processGone = !stillConfigured || !IsProcessRunning(g_ActiveProfileCopy.exeName);
+            if (processGone) {
+                if (g_ActiveProfileCopy.restore) RestoreActiveIfChanged();
+                else ClearActiveState();
             }
-        } else {
-            for (auto& p : g_Profiles) {
+        } else if (snap) {
+            for (size_t i = 0; i < snap->size(); ++i) {
+                const AppProfile& p = (*snap)[i];
                 if (p.enabled && IsProcessRunning(p.exeName)) {
                     ULONGLONG now = GetTickCount64();
                     if (g_ProcessFoundTime == 0) g_ProcessFoundTime = now;
 
                     if ((now - g_ProcessFoundTime) >= (ULONGLONG)(p.delaySec * 1000)) {
-                        g_OriginalDevMode = GetCurrentRes(p.displayDev);
-                        if (ChangeRes(p.displayDev, p.targetW, p.targetH, p.targetHz) == DISP_CHANGE_SUCCESSFUL) {
-                            g_ResChanged = true;
+                        DEVMODEW orig = GetCurrentRes(p.displayDev);
+                        int result = ChangeRes(p.displayDev, p.targetW, p.targetH, p.targetHz);
+                        // Publish the new active state under the restore lock so
+                        // the UI thread's RestoreActiveIfChanged() sees a
+                        // consistent (dev mode, active index, changed flag) set.
+                        {
+                            std::lock_guard<std::mutex> lock(g_RestoreMutex);
+                            g_OriginalDevMode = orig;
+                            g_ResChanged = (result == DISP_CHANGE_SUCCESSFUL);
+                            g_ActiveProfileCopy = p;   // value copy -> never dangles
+                            g_ActiveIndex = (int)i;
                         }
-                        g_ActiveProfile = &p;
                         break;
                     }
                 }
@@ -261,13 +340,13 @@ void RefreshList(int selectIndex = -1) {
         std::wstring display = p.exeName + L" (" + std::to_wstring(p.targetW) + L"x" + std::to_wstring(p.targetH) + L")";
         SendMessage(g_hList, LB_ADDSTRING, 0, (LPARAM)display.c_str());
     }
-    if (selectIndex >= 0 && selectIndex < g_Profiles.size()) {
+    if (selectIndex >= 0 && selectIndex < (int)g_Profiles.size()) {
         SendMessage(g_hList, LB_SETCURSEL, selectIndex, 0);
     }
 }
 
 void SelectProfile(int index) {
-    if (index >= 0 && index < g_Profiles.size()) {
+    if (index >= 0 && index < (int)g_Profiles.size()) {
         const auto& p = g_Profiles[index];
         SetWindowTextW(g_hExe, p.exePath.c_str());
 
@@ -301,6 +380,38 @@ void SelectProfile(int index) {
 BOOL CALLBACK SetFontCallback(HWND hwndChild, LPARAM lParam) {
     SendMessage(hwndChild, WM_SETFONT, lParam, TRUE);
     return TRUE;
+}
+
+// ==========================================
+// TEST-MODE AUTO-REVERT
+// ==========================================
+// When the user tests a display mode we apply it, then arm a countdown. If the
+// user does not confirm within the grace period we automatically restore the
+// previous mode. This is the safety net that the README always promised but
+// the original blocking MessageBox never delivered.
+#define TIMER_TEST_REVERT 1
+#define TEST_REVERT_SECONDS 15
+
+DEVMODEW g_TestOriginal;
+std::wstring g_TestDevice;
+bool g_TestActive = false;
+
+void CancelTestTimer(HWND hwnd) {
+    if (g_TestActive) {
+        KillTimer(hwnd, TIMER_TEST_REVERT);
+        g_TestActive = false;
+    }
+}
+
+// Returns true and writes the value when the field holds a positive integer.
+bool ReadPositiveInt(HWND hEdit, int minVal, int maxVal, int& out) {
+    WCHAR buf[16] = { 0 };
+    GetWindowTextW(hEdit, buf, 16);
+    if (wcslen(buf) == 0) return false;
+    int v = _wtoi(buf);
+    if (v < minVal || v > maxVal) return false;
+    out = v;
+    return true;
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -354,13 +465,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             HFONT hFont = CreateFontW(15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
             EnumChildWindows(hwnd, SetFontCallback, (LPARAM)hFont);
 
-            // Tray Icon Setup (Loads baked-in icon '1' instead of IDI_APPLICATION)
+            // Tray Icon Setup (loads the baked-in icon '1' at the correct small
+            // size so it renders crisply in the notification area).
+            g_hAppIcon = (HICON)LoadImageW(g_hInst, MAKEINTRESOURCEW(1), IMAGE_ICON,
+                                           GetSystemMetrics(SM_CXSMICON),
+                                           GetSystemMetrics(SM_CYSMICON),
+                                           LR_DEFAULTCOLOR);
+            if (!g_hAppIcon) g_hAppIcon = LoadIconW(NULL, IDI_APPLICATION);
+
             g_Nid.cbSize = sizeof(NOTIFYICONDATAW);
             g_Nid.hWnd = hwnd;
             g_Nid.uID = 1;
             g_Nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
             g_Nid.uCallbackMessage = WM_TRAYICON;
-            g_Nid.hIcon = LoadIconW(g_hInst, MAKEINTRESOURCE(1));
+            g_Nid.hIcon = g_hAppIcon;
             wcscpy_s(g_Nid.szTip, L"AutoRes Changer");
             Shell_NotifyIconW(NIM_ADD, &g_Nid);
             break;
@@ -438,48 +556,80 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
                 if (GetOpenFileNameW(&ofn)) SetWindowTextW(g_hExe, szFile);
             } else if (wmId == 102) { // Save
-                WCHAR exe[MAX_PATH], w[16], h[16], hz[16], del[16];
-                GetWindowTextW(g_hExe, exe, MAX_PATH); if (wcslen(exe) == 0) break;
-                GetWindowTextW(g_hW, w, 16); GetWindowTextW(g_hH, h, 16); 
-                GetWindowTextW(g_hHz, hz, 16); GetWindowTextW(g_hDelay, del, 16);
+                WCHAR exe[MAX_PATH];
+                GetWindowTextW(g_hExe, exe, MAX_PATH);
+                if (wcslen(exe) == 0) {
+                    MessageBoxW(hwnd, L"Select an executable path first.", L"Missing Path", MB_OK | MB_ICONWARNING);
+                    break;
+                }
+                int w = 0, h = 0;
+                if (!ReadPositiveInt(g_hW, 1, 32767, w) || !ReadPositiveInt(g_hH, 1, 32767, h)) {
+                    MessageBoxW(hwnd, L"Width and Height must be positive numbers (1-32767).", L"Invalid Resolution", MB_OK | MB_ICONWARNING);
+                    break;
+                }
+                WCHAR hzbuf[16] = { 0 }, delbuf[16] = { 0 };
+                GetWindowTextW(g_hHz, hzbuf, 16);
+                GetWindowTextW(g_hDelay, delbuf, 16);
+                int hz = _wtoi(hzbuf); if (hz < 0) hz = 0;
+                int delSec = _wtoi(delbuf); if (delSec < 0) delSec = 0;
 
                 AppProfile p;
                 p.exePath = exe; p.exeName = GetFileName(p.exePath);
-                p.targetW = _wtoi(w); p.targetH = _wtoi(h); p.targetHz = _wtoi(hz); p.delaySec = _wtoi(del);
+                p.targetW = w; p.targetH = h; p.targetHz = hz; p.delaySec = delSec;
                 p.restore = SendMessage(g_hRestore, BM_GETCHECK, 0, 0) == BST_CHECKED;
                 p.enabled = SendMessage(g_hEnable, BM_GETCHECK, 0, 0) == BST_CHECKED;
 
                 int comboIdx = SendMessage(g_hDisplayCombo, CB_GETCURSEL, 0, 0);
-                p.displayDev = (comboIdx > 0 && comboIdx < g_MonitorDevices.size()) ? g_MonitorDevices[comboIdx] : L"";
+                p.displayDev = (comboIdx > 0 && comboIdx < (int)g_MonitorDevices.size()) ? g_MonitorDevices[comboIdx] : L"";
 
                 int targetIdx = -1;
                 bool found = false;
                 for (size_t i = 0; i < g_Profiles.size(); ++i) {
                     if (_wcsicmp(g_Profiles[i].exePath.c_str(), p.exePath.c_str()) == 0) { 
-                        g_Profiles[i] = p; found = true; targetIdx = i; break; 
+                        g_Profiles[i] = p; found = true; targetIdx = (int)i; break; 
                     }
                 }
                 if (!found) {
                     g_Profiles.push_back(p);
-                    targetIdx = g_Profiles.size() - 1;
+                    targetIdx = (int)g_Profiles.size() - 1;
                 }
                 
-                SaveConfig(); 
-                RefreshList(targetIdx); 
+                SaveConfig();
+                PublishSnapshot();
+                RefreshList(targetIdx);
             } else if (wmId == 103) { // Delete
                 int idx = SendMessage(g_hList, LB_GETCURSEL, 0, 0);
-                if (idx != LB_ERR) { g_Profiles.erase(g_Profiles.begin() + idx); SaveConfig(); RefreshList(); SetWindowTextW(g_hExe, L""); }
+                if (idx != LB_ERR) { g_Profiles.erase(g_Profiles.begin() + idx); SaveConfig(); PublishSnapshot(); RefreshList(); SetWindowTextW(g_hExe, L""); }
             } else if (wmId == 104) { // Test
-                WCHAR w[16], h[16], hz[16];
-                GetWindowTextW(g_hW, w, 16); GetWindowTextW(g_hH, h, 16); GetWindowTextW(g_hHz, hz, 16);
+                int w = 0, h = 0, hz = 0;
+                if (!ReadPositiveInt(g_hW, 1, 32767, w) || !ReadPositiveInt(g_hH, 1, 32767, h)) {
+                    MessageBoxW(hwnd, L"Enter a valid Width and Height before testing.", L"Invalid Input", MB_OK | MB_ICONWARNING);
+                    break;
+                }
+                // Hz is optional: blank or 0 means "use the driver default".
+                {
+                    WCHAR hzbuf[16] = { 0 };
+                    GetWindowTextW(g_hHz, hzbuf, 16);
+                    hz = _wtoi(hzbuf);
+                    if (hz < 0) hz = 0;
+                }
                 int idx = SendMessage(g_hDisplayCombo, CB_GETCURSEL, 0, 0);
-                std::wstring dev = (idx > 0 && idx < g_MonitorDevices.size()) ? g_MonitorDevices[idx] : L"";
-                
+                std::wstring dev = (idx > 0 && idx < (int)g_MonitorDevices.size()) ? g_MonitorDevices[idx] : L"";
+
                 DEVMODEW orig = GetCurrentRes(dev);
-                if (ChangeRes(dev, _wtoi(w), _wtoi(h), _wtoi(hz)) == DISP_CHANGE_SUCCESSFUL) {
-                    MessageBoxW(hwnd, L"Resolution applied! Press OK to revert.", L"Test", MB_OK | MB_ICONINFORMATION);
-                    RestoreRes(dev, orig);
-                } else MessageBoxW(hwnd, L"Monitor does not support this mode.", L"Error", MB_OK | MB_ICONERROR);
+                if (ChangeRes(dev, w, h, hz) == DISP_CHANGE_SUCCESSFUL) {
+                    g_TestOriginal = orig;
+                    g_TestDevice = dev;
+                    g_TestActive = true;
+                    SetTimer(hwnd, TIMER_TEST_REVERT, (UINT)TEST_REVERT_SECONDS * 1000, NULL);
+                    std::wstring msg = L"Resolution applied. Click OK to keep it, or it will "
+                                       L"automatically revert in " + std::to_wstring(TEST_REVERT_SECONDS) + L" seconds.";
+                    MessageBoxW(hwnd, msg.c_str(), L"Testing Display Settings", MB_OK | MB_ICONINFORMATION);
+                    // If the user pressed OK within the window, keep the mode.
+                    if (g_TestActive) CancelTestTimer(hwnd);
+                } else {
+                    MessageBoxW(hwnd, L"Monitor does not support this mode.", L"Error", MB_OK | MB_ICONERROR);
+                }
             } else if (wmId == 105) { // Launch App
                 WCHAR exe[MAX_PATH]; GetWindowTextW(g_hExe, exe, MAX_PATH);
                 if (wcslen(exe) > 0) ShellExecuteW(NULL, L"open", exe, NULL, NULL, SW_SHOWNORMAL);
@@ -487,7 +637,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 SetRunAtStartup(SendMessage(g_hStartup, BM_GETCHECK, 0, 0) == BST_CHECKED);
             } else if (wmId == 107 && HIWORD(wParam) == CBN_SELCHANGE) { // Preset changed
                 int idx = SendMessage(g_hPresetCombo, CB_GETCURSEL, 0, 0);
-                if (idx > 0 && idx < g_Presets.size()) {
+                if (idx > 0 && idx < (int)g_Presets.size()) {
                     g_IgnoreEditChange = true;
                     SetWindowTextW(g_hW, std::to_wstring(g_Presets[idx].w).c_str());
                     SetWindowTextW(g_hH, std::to_wstring(g_Presets[idx].h).c_str());
@@ -502,6 +652,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             break;
         }
+        case WM_TIMER: {
+            if (wParam == TIMER_TEST_REVERT && g_TestActive) {
+                RestoreRes(g_TestDevice, g_TestOriginal);
+                g_TestActive = false;
+                KillTimer(hwnd, TIMER_TEST_REVERT);
+            }
+            break;
+        }
         case WM_TRAYICON: {
             if (lParam == WM_LBUTTONDBLCLK) { ShowWindow(hwnd, SW_RESTORE); SetForegroundWindow(hwnd); }
             else if (lParam == WM_RBUTTONUP) {
@@ -512,14 +670,33 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             break;
         }
-        case WM_CLOSE:
+        case WM_CLOSE: {
+            // Keep the icon/message flags intact and just add the balloon.
+            NOTIFYICONDATAW nid = g_Nid;
+            nid.uFlags = NIF_INFO;
+            wcscpy_s(nid.szInfoTitle, L"AutoRes Changer");
+            wcscpy_s(nid.szInfo, L"Running in background. Right-click tray icon to exit.");
+            nid.dwInfoFlags = NIIF_INFO;
+            Shell_NotifyIconW(NIM_MODIFY, &nid);
             ShowWindow(hwnd, SW_HIDE);
-            g_Nid.uFlags = NIF_INFO; wcscpy_s(g_Nid.szInfoTitle, L"AutoRes Changer");
-            wcscpy_s(g_Nid.szInfo, L"Running in background. Right-click tray icon to exit.");
-            Shell_NotifyIconW(NIM_MODIFY, &g_Nid);
-            return 0; 
-        case WM_DESTROY:
-            Shell_NotifyIconW(NIM_DELETE, &g_Nid); PostQuitMessage(0); break;
+            return 0;
+        }
+        case WM_ENDSESSION:
+        case WM_DESTROY: {
+            // On logoff/shutdown (WM_ENDSESSION) or normal exit, make sure the
+            // desktop is restored if we are the ones who changed it.
+            CancelTestTimer(hwnd);
+            if (msg == WM_ENDSESSION) {
+                RestoreActiveIfChanged();
+                break;
+            }
+            Shell_NotifyIconW(NIM_DELETE, &g_Nid);
+            RestoreActiveIfChanged();
+            if (g_hAppIcon) { DestroyIcon(g_hAppIcon); g_hAppIcon = NULL; }
+            if (g_hInstanceMutex) { CloseHandle(g_hInstanceMutex); g_hInstanceMutex = NULL; }
+            PostQuitMessage(0);
+            break;
+        }
     }
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
@@ -528,10 +705,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 // APPLICATION ENTRY
 // ==========================================
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nCmdShow) {
+    (void)hPrevInstance;
     SetProcessDPIAware(); 
     g_hInst = hInstance; // Store instance for resource retrieval
+
+    // Single-instance guard: a second launch should not create a duplicate tray
+    // icon or a competing monitor thread. If already running, just exit.
+    g_hInstanceMutex = CreateMutexW(NULL, TRUE, L"AutoResChanger_SingleInstance");
+    if (g_hInstanceMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(g_hInstanceMutex);
+        g_hInstanceMutex = NULL;
+        return 0;
+    }
+
     InitConfigPath(); 
     LoadConfig();
+    PublishSnapshot();
 
     WNDCLASSW wc = {0}; 
     wc.lpfnWndProc = WndProc; 
@@ -539,7 +728,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW); 
     wc.lpszClassName = L"AutoResChangerClass";
     wc.hCursor = LoadCursor(NULL, IDC_ARROW); 
-    wc.hIcon = LoadIconW(hInstance, MAKEINTRESOURCE(1)); // Loads custom icon for window/taskbar
+    wc.hIcon = (HICON)LoadImageW(hInstance, MAKEINTRESOURCEW(1), IMAGE_ICON,
+                                 0, 0, LR_DEFAULTSIZE | LR_DEFAULTCOLOR);
+    if (!wc.hIcon) wc.hIcon = LoadIconW(NULL, IDI_APPLICATION);
     RegisterClassW(&wc);
 
     g_hMain = CreateWindowW(L"AutoResChangerClass", L"AutoRes Changer", WS_OVERLAPPEDWINDOW,
@@ -568,7 +759,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
         UpdateWindow(g_hMain);
     }
 
-    MSG msg; while (GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
-    g_MonitorRunning = false; monitorThread.join();
-    return 0;
+    MSG msg;
+    BOOL bRet;
+    while ((bRet = GetMessage(&msg, NULL, 0, 0)) != 0) {
+        if (bRet == -1) break; // GetMessage error
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    g_MonitorRunning = false;
+    if (monitorThread.joinable()) monitorThread.join();
+    if (g_hInstanceMutex) { CloseHandle(g_hInstanceMutex); g_hInstanceMutex = NULL; }
+    return (int)msg.wParam;
 }

@@ -36,9 +36,9 @@ If you prefer to compile the application yourself using a lightweight compiler l
    ```bash
    windres resource.rc -O coff -o resource.res
    ```
-3. Run the C++ compiler to build the final executable:
+3. Run the C++ compiler to build the final executable. Note that `-municode` and linking `resource.res` are required so the Unicode resource APIs resolve correctly:
    ```bash
-   g++ -O2 main.cpp resource.res -o AutoResChanger.exe -mwindows -municode -luser32 -lgdi32 -lshell32 -lcomdlg32 -ladvapi32
+   g++ -O2 -Wall -Wextra main.cpp resource.res -o AutoResChanger.exe -mwindows -municode -luser32 -lgdi32 -lshell32 -lcomdlg32 -ladvapi32
    ```
 
 <hr>
@@ -58,8 +58,8 @@ Managing your custom application profiles is straightforward and handled entirel
 If you want to verify whether a custom resolution or refresh rate is supported by your monitor before saving it:
 1. Input your target dimensions or select an existing profile.
 2. Click the **Test Display Settings** button.
-3. Your screen will temporarily transition to the selected mode. 
-4. A prompt will appear on your screen. Clicking **OK** or waiting will safely revert your monitor to its original desktop settings.
+3. Your screen will temporarily transition to the selected mode.
+4. A prompt will appear on your screen. Clicking **OK** keeps the mode; if you do nothing, the mode automatically reverts to your original desktop settings after 15 seconds. This guarantees you can always recover even if the tested mode renders your display unreadable.
 
 ---
 
@@ -69,6 +69,8 @@ AutoRes Changer includes several features to accommodate complex setups and game
 
 * <span style="color:#2980b9"><b>Multi-Monitor Routing:</b></span> Instead of changing settings globally, you can assign target resolutions to specific displays. The utility reads your active hardware configuration to target individual monitors cleanly.
 * <span style="color:#27ae60"><b>Startup Delay (Grace Period):</b></span> Some games load an initial splash screen or configuration launcher before launching the actual game window. Setting a **Delay** (in seconds) tells the utility to wait until the primary game window is fully loaded before executing the resolution override.
+* <span style="color:#8e44ad"><b>Input Validation:</b></span> Width and Height are validated before a profile is saved or tested, preventing accidental zero-sized or malformed modes.
+* <span style="color:#c0392b"><b>Single Instance:</b></span> Only one copy of AutoRes Changer can run at a time, so launching it twice never leaves duplicate tray icons or competing monitors fighting over your display settings.
 * <span style="color:#d35400"><b>Auto-Start on Boot:</b></span> Checking **Start automatically with Windows** registers the application in your local user workspace. Upon system boot, it launches silently in the background and rests minimized in your system tray without interrupting you.
 
 ---
@@ -76,6 +78,7 @@ AutoRes Changer includes several features to accommodate complex setups and game
 ## Background Behavior & Reversion Safety
 
 * **Minimizing to Tray:** Closing the configuration window via the standard close button does not exit the utility. It hides the interface to the system tray so that monitoring remains active. To restore the window, simply double-click the system tray icon near your clock.
+* **Guaranteed Restoration:** If a profile is active (i.e. your resolution is currently changed) and you exit the utility — or log off / shut down Windows — the original desktop resolution is restored automatically first. You will never be left stuck at a game resolution after closing AutoRes Changer.
 * **Emergency Reversion:** The display modifications are applied using standard Windows dynamic sessions (`CDS_FULLSCREEN`). This design choice means that your custom resolutions are not permanently written to your Windows registry. If a game crashes or your system restarts unexpectedly, Windows will natively restore your default desktop resolution automatically.
 
 ---

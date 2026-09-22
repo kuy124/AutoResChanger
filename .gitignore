@@ -1,0 +1,12 @@
+# Build artifacts
+*.exe
+*.res
+*.o
+*.obj
+*.pdb
+*.ilk
+build/
+out/
+
+# MSVC / MinGW
+*.dSYM/
