@@ -1,0 +1,16 @@
+# Build artifacts
+*.exe
+*.res
+*.o
+*.obj
+*.pdb
+*.ilk
+build/
+out/
+
+# Test artifacts
+tests/test_runner.exe
+tests/*.dSYM/
+
+# MSVC / MinGW
+*.dSYM/
